@@ -1,0 +1,11 @@
+{
+	"name": "ai",
+	"version": "0.1.0",
+	"title": "AI",
+	"author": "Eric Culp",
+	"contact": "eculperic@gmail.com",
+	"homepage": "https://github.com/singron/factorio-ai",
+	"description": "Stuff",
+	"factorio_version": "0.15",
+	"dependencies": ["base >= 0.4.1"]
+}
