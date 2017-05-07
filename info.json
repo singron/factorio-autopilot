@@ -1,11 +1,11 @@
 {
-	"name": "ai",
+	"name": "autopilot",
 	"version": "0.1.0",
-	"title": "AI",
+	"title": "Autopilot",
 	"author": "Eric Culp",
 	"contact": "eculperic@gmail.com",
-	"homepage": "https://github.com/singron/factorio-ai",
-	"description": "Stuff",
+	"homepage": "https://github.com/singron/factorio-autopilot",
+	"description": "A mod that plays the game by itself.",
 	"factorio_version": "0.15",
 	"dependencies": ["base >= 0.4.1"]
 }
