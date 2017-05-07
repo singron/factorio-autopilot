@@ -888,6 +888,6 @@ script.on_event(defines.events.on_tick, function(event) -- luacheck: ignore even
 	local status = action:do_update('+')
 	if status == Status.DONE then
 		action = nil
-		player.print("plan done")
+		player.print("plan done after "..event.tick..' ticks')
 	end
 end)
