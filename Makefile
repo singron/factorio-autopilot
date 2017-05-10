@@ -28,3 +28,5 @@ deps:
 
 test:
 	$(LUACHECK) $(LUACHECKOPTS) ./*.lua
+	@echo Checking that Status creation is not a tail call
+	! grep -n 'return Status\.\(done\|busy\|wait\|err\)()' ./*.lua

@@ -2,31 +2,81 @@ local util = require('util')
 local player;
 local made_by = {}
 
-local Status = {}
-Status.DONE = {}
-Status.BUSY = {}
-Status.WAIT = {}
-Status.ERROR = {}
+local Status = {
+	DONE = {},
+	BUSY = {},
+	WAIT = {},
+	ERR = {},
+}
+
+local _Status = {}
+
+function _Status:is_done()
+	return self.kind == Status.DONE
+end
+function _Status:is_busy()
+	return self.kind == Status.BUSY
+end
+function _Status:is_wait()
+	return self.kind == Status.WAIT
+end
+function _Status:is_err()
+	return self.kind == Status.ERR
+end
+
+function _Status:tostring()
+	return self.desc -- ..' '..self.bt
+end
+
+local function new_status(kind, i)
+	local ks = 'UNKNOWN'
+	if kind == Status.DONE then
+		ks = 'DONE'
+	elseif kind == Status.BUSY then
+		ks = 'BUSY'
+	elseif kind == Status.WAIT then
+		ks = 'WAIT'
+	elseif kind == Status.ERR then
+		ks = 'ERR'
+	end
+	local s = {
+		kind = kind,
+		desc = ks..'('..(i.name or '_')..':'..i.short_src..':'..i.currentline..')',
+		bt = debug.traceback(),
+	}
+	setmetatable(s, {__index = _Status})
+	return s
+end
+
+function Status.done()
+	return new_status(Status.DONE, debug.getinfo(2, 'nSl'))
+end
+
+function Status.busy()
+	return new_status(Status.BUSY, debug.getinfo(2, 'nSl'))
+end
+
+function Status.wait()
+	return new_status(Status.WAIT, debug.getinfo(2, 'nSl'))
+end
+
+function Status.err()
+	return new_status(Status.ERR, debug.getinfo(2, 'nSl'))
+end
 
 local function is_status(x)
 	if x == nil then
 		return false
 	end
-	for _, s in pairs(Status) do
-		if s == x then
-			return true
-		end
+	local m = getmetatable(x)
+	if m == nil then
+		return false
 	end
-	return false
+	return m.__index == _Status
 end
 
 local function status_tostring(x)
-	for n, s in pairs(Status) do
-		if s == x then
-			return n
-		end
-	end
-	return 'UNKNOWN('..tostring(x)..')'
+	return x:tostring()
 end
 
 local function startswith(s, prefix)
@@ -96,7 +146,8 @@ function Plan:new_plan_type()
 end
 
 function Plan:print(prefix)
-	print(prefix..self.name..' '..status_tostring(self:check_status()))
+	local status = self:check_status()
+	print(prefix..self.name..' '..status_tostring(status))
 	for _, dep in ipairs(self.deps) do
 		dep:print(prefix..'-')
 	end
@@ -104,8 +155,19 @@ end
 
 function Plan:clear_deps()
 	if #self.deps > 0 then
+		for _, dep in ipairs(self.deps) do
+			dep:do_free()
+		end
 		self.deps = {}
 	end
+end
+
+function Plan:free() -- luacheck: ignore self
+end
+
+function Plan:do_free()
+	self:free()
+	self:clear_deps()
 end
 
 function Plan:do_check_status()
@@ -114,26 +176,26 @@ function Plan:do_check_status()
 	local err = false
 	for _, dep in ipairs(self.deps) do
 		local dep_status = dep:do_check_status()
-		if dep_status == Status.BUSY then
+		if dep_status:is_busy() then
 			busy = true
-		elseif dep_status == Status.WAIT then
+		elseif dep_status:is_wait() then
 			wait = true
-		elseif dep_status == Status.ERROR then
+		elseif dep_status:is_err() then
 			err = true
 		end
 	end
 	if busy then
-		return Status.BUSY
+		return (Status.busy())
 	elseif wait then
-		return Status.WAIT
+		return (Status.wait())
 	elseif err then
-		return Status.ERROR
+		return (Status.err())
 	end
-	return self:check_status()
+	return (self:check_status())
 end
 
 function Plan:check_status() -- luacheck: ignore self
-	return Status.DONE
+	return (Status.done())
 end
 
 function Plan:do_update(prefix)
@@ -142,7 +204,7 @@ function Plan:do_update(prefix)
 		self.started = true
 	end
 	local status = self:do_check_status()
-	if status == Status.DONE then
+	if status:is_done() then
 		if self.started then
 			player.print(prefix..'Finished '..self.name)
 		end
@@ -154,30 +216,30 @@ function Plan:do_update(prefix)
 	local err = false
 	for _, dep in ipairs(self.deps) do
 		local dep_status = dep:do_check_status()
-		if dep_status == Status.BUSY then
+		if dep_status:is_busy() then
 			local new_dep_status = dep:do_update(prefix..'-')
 			self.updated = false
-			if not is_status(new_dep_status) or new_dep_status == Status.BUSY then
-				return Status.BUSY
+			if not is_status(new_dep_status) or new_dep_status:is_busy()then
+				return (Status.busy())
 			end
 			dep_status = new_dep_status
 		end
-		if dep_status == Status.DONE then
+		if dep_status:is_done() then
 			if dep.started then
 				player.print(prefix..'Finished '..dep.name)
 			end
 			dep.started = false
 			dep.updated = false
-		elseif dep_status == Status.WAIT then
+		elseif dep_status:is_wait() then
 			wait = true
-		elseif dep_status == Status.ERROR then
+		elseif dep_status:is_err() then
 			err = true
 		end
 	end
 	if wait then
-		return Status.WAIT
+		return (Status.wait())
 	elseif err then
-		return Status.ERROR
+		return (Status.err())
 	end
 	-- All deps are done.
 	if not self.updated then
@@ -188,7 +250,7 @@ function Plan:do_update(prefix)
 	if not is_status(status) then
 		player.print('ERROR: bad status from '..self.name..': '..status_tostring(status))
 		-- say busy so that it gets checked next tick
-		return Status.BUSY
+		return (Status.busy())
 	end
 	return status
 end
@@ -215,9 +277,9 @@ end
 function MoveNear:check_status()
 	local dir = self:direction()
 	if dir.hor == 0 and dir.vert == 0 then
-		return Status.DONE
+		return (Status.done())
 	end
-	return Status.BUSY
+	return (Status.busy())
 end
 
 function MoveNear:direction()
@@ -305,7 +367,7 @@ function MoveNear:update()
 			direction = self.wander,
 		}
 		self.wander_count = self.wander_count - 1
-		return Status.BUSY
+		return (Status.busy())
 	end
 	if #self.past_positions >= 10 then
 		local dist = util.distance(self.past_positions[1], player.position)
@@ -314,13 +376,13 @@ function MoveNear:update()
 			local tree = get_nearest_tree()
 			if tree ~= nil and entity_distance_to_player(tree) < 1 then
 				table.insert(self.deps, ChopTree:new(tree))
-				return Status.BUSY
+				return (Status.busy())
 			end
 			player.print('stuck')
 			self.wander = pick_random(defines.direction)
 			self.wander_count = math.random(10, 10 + self.stuck_count)
 			self.stuck_count = self.stuck_count + 1
-			return Status.BUSY
+			return (Status.busy())
 		end
 	end
 	table.insert(self.past_positions, player.position)
@@ -333,7 +395,7 @@ function MoveNear:update()
 			walking = false,
 			direction = defines.direction.north,
 		}
-		return Status.DONE
+		return (Status.done())
 	end
 	if hor == 0 then
 		if vert > 0 then
@@ -362,7 +424,7 @@ function MoveNear:update()
 		direction = dir,
 		walking = true,
 	}
-	return Status.BUSY
+	return (Status.busy())
 end
 
 local function get_nearest_ore(name)
@@ -396,9 +458,9 @@ end
 
 function MineOre:check_status()
 	if not self.tile.valid or self.cur_amount >= self.amount then
-		return Status.DONE
+		return (Status.done())
 	end
-	return Status.BUSY
+	return (Status.busy())
 end
 
 function MineOre:update()
@@ -418,7 +480,7 @@ function MineOre:update()
 		}
 	end
 	self.cur_amount = self.starting_amount - self.tile.amount
-	return Status.BUSY
+	return (Status.busy())
 end
 
 function ChopTree:new(tree)
@@ -433,9 +495,9 @@ end
 
 function ChopTree:check_status()
 	if self.tree.valid then
-		return Status.BUSY
+		return (Status.busy())
 	end
-	return Status.DONE
+	return (Status.done())
 end
 
 function ChopTree:update()
@@ -454,7 +516,7 @@ function ChopTree:update()
 			position = self.tree.position,
 		}
 	end
-	return Status.BUSY
+	return (Status.busy())
 end
 
 local SmeltItem = Plan:new_plan_type()
@@ -516,18 +578,18 @@ end
 
 function SmeltItem:check_status()
 	if self.cur_amount >= self.amount then
-		return Status.DONE
+		return (Status.done())
 	end
 	if self.smelter == nil then
-		return Status.BUSY
+		return (Status.busy())
 	end
 	if self:is_smelter_full() then
-		return Status.BUSY
+		return (Status.busy())
 	end
 	if self.cur_amount + self:pending_amount() >= self.amount then
-		return Status.WAIT
+		return (Status.wait())
 	end
-	return Status.BUSY
+	return (Status.busy())
 end
 
 local entity_cache = {}
@@ -540,9 +602,10 @@ function SmeltItem:set_smelter()
 	end
 
 	-- Check cache
-	for _, e in ipairs(entity_cache) do
+	for i, e in ipairs(entity_cache) do
 		if e.name == 'stone-furnace' and not e.is_crafting() then
 			self.smelter = e
+			table.remove(entity_cache, i)
 			return true
 		end
 	end
@@ -563,7 +626,6 @@ function SmeltItem:set_smelter()
 		position = pos,
 		force = player.force,
 	})
-	table.insert(entity_cache, self.smelter)
 	if self.smelter == nil then
 		player.print('could not create furnace')
 		return false
@@ -573,6 +635,12 @@ function SmeltItem:set_smelter()
 		player.print('Did not remove item from inventory')
 	end
 	return true
+end
+
+function SmeltItem:free()
+	if self.smelter ~= nil then
+		table.insert(entity_cache, self.smelter)
+	end
 end
 
 function SmeltItem:go_near_smelter()
@@ -610,7 +678,7 @@ end
 function SmeltItem:update()
 	self:clear_deps()
 	if not self:set_smelter() then
-		return Status.BUSY
+		return (Status.busy())
 	end
 
 	local near_smelter = entity_distance_to_player(self.smelter) < 3
@@ -619,14 +687,14 @@ function SmeltItem:update()
 	if self:is_smelter_full() or out_inv.get_item_count(self.item) + self.cur_amount >= self.amount then
 		if not near_smelter then
 			self:go_near_smelter()
-			return Status.BUSY
+			return (Status.busy())
 		end
 		if not self:empty_smelter() then
-			return Status.ERROR
+			return (Status.err())
 		end
 
 		if self.cur_amount >= self.amount then
-			return Status.DONE
+			return (Status.done())
 		end
 	end
 
@@ -634,12 +702,12 @@ function SmeltItem:update()
 	if fuel_inv.is_empty() then
 		if not near_smelter then
 			self:go_near_smelter()
-			return Status.BUSY
+			return (Status.busy())
 		end
 		local fuel_amount = player_inv_get_item_count('raw-wood')
 		if fuel_amount < 1 then
 			table.insert(self.deps, GetItem:new('raw-wood', 20))
-			return Status.BUSY
+			return (Status.busy())
 		end
 		if fuel_amount > 20 then
 			fuel_amount = 20
@@ -650,13 +718,13 @@ function SmeltItem:update()
 			player_inv_remove({name='raw-wood', count=insert_amount})
 		else
 			player.print('could not fuel furnace')
-			return Status.ERROR
+			return (Status.err())
 		end
 	end
 
 	local pending_amount = self:pending_amount()
 	if self.cur_amount + pending_amount >= self.amount then
-		return Status.WAIT
+		return (Status.wait())
 	end
 
 	-- Feed inputs
@@ -680,23 +748,23 @@ function SmeltItem:update()
 				if in_inv.can_insert({name=ing.name, count=insert}) then
 					if not near_smelter then
 						self:go_near_smelter()
-						return Status.BUSY
+						return (Status.busy())
 					end
 					insert = in_inv.insert({name=ing.name, count=insert})
 					player_inv_remove({name=ing.name, count=insert})
 				else
 					player.print('cannot insert into furnace')
-					return Status.ERROR
+					return (Status.err())
 				end
 			end
 			if insert < want then
 				table.insert(self.deps, GetItem:new(ing.name, want - insert))
-				return Status.BUSY
+				return (Status.busy())
 			end
 		end
 	end
 	-- We
-	return Status.WAIT
+	return (Status.wait())
 end
 
 function GetItem:new(item, amount)
@@ -736,9 +804,9 @@ end
 
 function GetItem:check_status()
 	if self:get_inv_count() >= self.amount then
-		return Status.DONE
+		return (Status.done())
 	end
-	return Status.BUSY
+	return (Status.busy())
 end
 
 function GetItem:craft_update()
@@ -752,7 +820,7 @@ function GetItem:craft_update()
 	end
 	local inv_count = self:get_inv_count()
 	if inv_count + crafting_count >= self.amount then
-		return Status.WAIT
+		return (Status.wait())
 	end
 	-- We must craft now
 	local togo = self.amount - inv_count - crafting_count
@@ -766,19 +834,19 @@ function GetItem:craft_update()
 	end
 	runs = runs - tocraft
 	if runs == 0 then
-		return Status.WAIT
+		return (Status.wait())
 	end
 	-- We need more ingredients
 	for _, ing in ipairs(self.recipe.ingredients) do
 		table.insert(self.deps, GetItem:new(ing.name, ing.amount * runs))
 	end
-	return Status.BUSY
+	return (Status.busy())
 end
 
 function GetItem:update()
 	self:clear_deps()
 	local status = self:check_status()
-	if status == Status.DONE then
+	if status == Status.done() then
 		return status
 	end
 	if self.recipe ~= nil then
@@ -786,7 +854,7 @@ function GetItem:update()
 			return self:craft_update()
 		end
 		table.insert(self.deps, SmeltItem:new(self.item, self.amount, self.recipe))
-		return Status.BUSY
+		return (Status.busy())
 	end
 	if self.item == "raw-wood" then
 		table.insert(self.deps, ChopTree:new(get_nearest_tree()))
@@ -797,9 +865,9 @@ function GetItem:update()
 		table.insert(self.deps, MineOre:new(get_nearest_ore(self.item), self.amount))
 	else
 		player.print('no way to get '..self.item)
-		return Status.ERROR
+		return (Status.err())
 	end
-	return Status.BUSY
+	return (Status.busy())
 end
 
 local MasterPlan = Plan:new_plan_type()
@@ -886,7 +954,8 @@ script.on_event(defines.events.on_tick, function(event) -- luacheck: ignore even
 	end
 
 	local status = action:do_update('+')
-	if status == Status.DONE then
+	if is_status(status) and status:is_done() then
+		action:do_free()
 		action = nil
 		player.print("plan done after "..event.tick..' ticks')
 	end
