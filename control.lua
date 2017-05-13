@@ -25,10 +25,12 @@ function _Status:is_err()
 end
 
 function _Status:tostring()
-	return self.desc -- ..' '..self.bt
+	return self.desc
 end
 
-local function new_status(kind, i)
+local DEBUG_STATUS = false
+
+local function new_status(kind)
 	local ks = 'UNKNOWN'
 	if kind == Status.DONE then
 		ks = 'DONE'
@@ -39,29 +41,34 @@ local function new_status(kind, i)
 	elseif kind == Status.ERR then
 		ks = 'ERR'
 	end
+
 	local s = {
 		kind = kind,
-		desc = ks..'('..(i.name or '_')..':'..i.short_src..':'..i.currentline..')',
-		bt = debug.traceback(),
 	}
+	if DEBUG_STATUS then
+		local i = debug.getinfo(2, 'nSl')
+		s.desc = ks..'('..(i.name or '_')..':'..i.short_src..':'..i.currentline..')'
+	else
+		s.desc = ks
+	end
 	setmetatable(s, {__index = _Status})
 	return s
 end
 
 function Status.done()
-	return new_status(Status.DONE, debug.getinfo(2, 'nSl'))
+	return new_status(Status.DONE)
 end
 
 function Status.busy()
-	return new_status(Status.BUSY, debug.getinfo(2, 'nSl'))
+	return new_status(Status.BUSY)
 end
 
 function Status.wait()
-	return new_status(Status.WAIT, debug.getinfo(2, 'nSl'))
+	return new_status(Status.WAIT)
 end
 
 function Status.err()
-	return new_status(Status.ERR, debug.getinfo(2, 'nSl'))
+	return new_status(Status.ERR)
 end
 
 local function is_status(x)
@@ -79,14 +86,10 @@ local function status_tostring(x)
 	return x:tostring()
 end
 
-local function startswith(s, prefix)
-	return string.sub(s, 1,string.len(prefix))==prefix
-end
-
 local function player_inventories()
 	local res = {}
 	for name, inv in pairs(defines.inventory) do
-		if startswith(name, 'player_') then
+		if name == 'player_main' or name == 'player_quickbar' then
 			local i = player.get_inventory(inv)
 			if i ~= nil then
 				table.insert(res, i)
@@ -126,6 +129,125 @@ local function player_inv_insert(stack)
 	return player.get_inventory(defines.inventory.player_main).insert(stack)
 end
 
+local Reservation = {}
+
+-- Inventory is reserved so that one (high priority) plan doesn't keep
+-- gathering an item that gets consumed in another plan.
+local inventory_reservations = {}
+
+function Reservation:new()
+	local r = {
+		items = {},
+	}
+	setmetatable(r, {__index = self})
+	return r
+end
+
+function Reservation:take(res)
+	if res == nil or res.items == nil then
+		return
+	end
+	for item, count in pairs(res.items) do
+		self.items[item] = (self.items[item] or 0) + count
+	end
+	res.items = {}
+end
+
+-- Returns the amount actually allocated.
+function Reservation:alloc_item(item, count)
+	local reserved = inventory_reservations[item] or 0
+	local have = player_inv_get_item_count(item)
+	local avail = have - reserved
+	if avail < count then
+		count = avail
+	end
+	self.items[item] = (self.items[item] or 0) + count
+	inventory_reservations[item] = reserved + count
+	return count
+end
+
+function Reservation:alloc_item_to(item, want_count)
+	local count = self:item_count(item)
+	if count < want_count then
+		local added = self:alloc_item(item, want_count - count)
+		count = count + added
+	end
+	return count
+end
+
+function Reservation:use_item(item, count)
+	count = self:free_item(item, count)
+	local have = player_inv_get_item_count(item)
+	if count > have then
+		count = have
+	end
+	count = player_inv_remove({name=item, count=count})
+	return count
+end
+
+function Reservation:create_item(item, count)
+	count = player_inv_insert({name=item, count=count})
+	return self:alloc_item(item, count)
+end
+
+function Reservation:free_item(item, count)
+	if (self.items[item] or 0) < count then
+		player.print('ERROR tried to free '..tostring(count)..' but have '..tostring(self.items[item]))
+		count = self.items[item] or 0
+	end
+	local reserved = inventory_reservations[item] or 0
+	if reserved < count then
+		player.print('ERROR tried to free '..tostring(count)..' but have '..tostring(reserved)..' globally')
+		count = reserved
+	end
+	self.items[item] = (self.items[item] or 0) - count
+	inventory_reservations[item] = reserved - count
+	return count
+end
+
+function Reservation:free()
+	local items = {}
+	-- Can't iterate while mutating, so make a copy.
+	for item, _ in pairs(self.items) do
+		table.insert(items, item)
+	end
+	for _, item in ipairs(items) do
+		self:free_item(item, self.items[item])
+	end
+end
+
+function Reservation:item_count(item)
+	local count = self.items[item] or 0
+	local actual_count = player_inv_get_item_count(item)
+	if count > actual_count then
+		player.print('ERROR bad count')
+		count = actual_count
+	end
+	return count
+end
+
+function Reservation:total_items()
+	local total = 0
+	for _, count in pairs(self.items) do
+		total = total + count
+	end
+	return total
+end
+
+function Reservation:tostring()
+	local s = 'Res('
+	local comma = false
+	for item, count in pairs(self.items) do
+		if comma then
+			s = s..','
+		end
+		s = s .. item..'='..tostring(count)
+		comma = true
+	end
+	s = s .. ')'
+	return s
+end
+
 local Plan = {}
 Plan.__index = Plan
 
@@ -139,17 +261,30 @@ function Plan:new_plan_type()
 		inst.updated = false
 		inst.name = "unknown plan"
 		inst.deps = {}
+		inst.reservation = Reservation:new()
 		return inst
 	end
 	setmetatable(plan, { __index = base })
 	return plan
 end
 
+function Plan:is_plan(plan)
+	local m = getmetatable(self)
+	return m.__index == plan
+end
+
 function Plan:print(prefix)
 	local status = self:check_status()
-	print(prefix..self.name..' '..status_tostring(status))
+	print(prefix..self.name..' '..status_tostring(status)..' '..self.reservation:tostring())
 	for _, dep in ipairs(self.deps) do
 		dep:print(prefix..'-')
+	end
+end
+
+function Plan:take_deps(res)
+	for _, dep in ipairs(self.deps) do
+		dep:take_deps(res)
+		res:take(dep.reservation)
 	end
 end
 
@@ -162,12 +297,13 @@ function Plan:clear_deps()
 	end
 end
 
-function Plan:free() -- luacheck: ignore self
+function Plan:free()
+	self.reservation:free()
 end
 
 function Plan:do_free()
-	self:free()
 	self:clear_deps()
+	self:free()
 end
 
 function Plan:do_check_status()
@@ -448,8 +584,7 @@ function MineOre:new(tile, amount)
 	plan.tile = tile
 	plan.amount = amount
 	plan.name = "MineOre("..tile.name..","..amount..")"
-	plan.starting_amount = tile.amount
-	plan.cur_amount = 0
+	plan.last_amount = tile.amount
 	plan.deps = {
 		MoveNear:new(tile.position, 2),
 	}
@@ -457,7 +592,7 @@ function MineOre:new(tile, amount)
 end
 
 function MineOre:check_status()
-	if not self.tile.valid or self.cur_amount >= self.amount then
+	if not self.tile.valid or self.reservation:item_count(self.tile.name) >= self.amount then
 		return (Status.done())
 	end
 	return (Status.busy())
@@ -479,7 +614,7 @@ function MineOre:update()
 			position = self.tile.position,
 		}
 	end
-	self.cur_amount = self.starting_amount - self.tile.amount
+	self.reservation:alloc_item(self.tile.name, self.last_amount - self.tile.amount)
 	return (Status.busy())
 end
 
@@ -526,8 +661,7 @@ function SmeltItem:new(item, amount, recipe)
 	plan.item = item
 	plan.amount = amount
 	plan.recipe = recipe
-	plan.name = 'SmeltItem('..item..','..amount..')'
-	plan.cur_amount = 0
+	plan:set_name()
 
 	plan.recipe_amount = 0
 	for _, p in ipairs(recipe.products) do
@@ -576,29 +710,20 @@ function SmeltItem:pending_amount()
 	return self.recipe_amount * runs
 end
 
-function SmeltItem:check_status()
-	if self.cur_amount >= self.amount then
-		return (Status.done())
-	end
-	if self.smelter == nil then
-		return (Status.busy())
-	end
-	if self:is_smelter_full() then
-		return (Status.busy())
-	end
-	if self.cur_amount + self:pending_amount() >= self.amount then
-		return (Status.wait())
-	end
-	return (Status.busy())
-end
-
 local entity_cache = {}
 
 local GetItem = Plan:new_plan_type()
 
+function SmeltItem:set_name()
+	self.name = 'SmeltItem('..self.item..','..tostring(self.amount)..','..tostring(self.smelter)..')'
+end
+
 function SmeltItem:set_smelter()
 	if self.smelter ~= nil then
-		return true
+		if self.smelter.valid then
+			return true
+		end
+		self.smelter = nil
 	end
 
 	-- Check cache
@@ -606,23 +731,25 @@ function SmeltItem:set_smelter()
 		if e.name == 'stone-furnace' and not e.is_crafting() then
 			self.smelter = e
 			table.remove(entity_cache, i)
+			self:set_name()
 			return true
 		end
 	end
 
 	-- Check inventory
-	if player_inv_get_item_count('stone-furnace') <= 0 then
-		table.insert(self.deps, GetItem:new('stone-furnace', 1))
+	local furnace = 'stone-furnace'
+	if self.reservation:alloc_item_to(furnace, 1) < 1 then
+		table.insert(self.deps, GetItem:new(furnace, 1))
 		return false
 	end
 	local surf = player.surface
-	local pos = surf.find_non_colliding_position('stone-furnace', player.position, 100, 4)
+	local pos = surf.find_non_colliding_position(furnace, player.position, 100, 4)
 	if pos == nil then
 		player.print('cannot find position for stone-furnace')
 		return false
 	end
 	self.smelter = surf.create_entity({
-		name = 'stone-furnace',
+		name = furnace,
 		position = pos,
 		force = player.force,
 	})
@@ -630,8 +757,9 @@ function SmeltItem:set_smelter()
 		player.print('could not create furnace')
 		return false
 	end
+	self:set_name()
 
-	if player_inv_remove({ name = 'stone-furnace' }) < 1 then
+	if self.reservation:use_item(furnace, 1) < 1 then
 		player.print('Did not remove item from inventory')
 	end
 	return true
@@ -640,6 +768,7 @@ end
 function SmeltItem:free()
 	if self.smelter ~= nil then
 		table.insert(entity_cache, self.smelter)
+		self.smelter = nil
 	end
 end
 
@@ -649,7 +778,7 @@ end
 
 function SmeltItem:is_smelter_full()
 	local out_inv = self.smelter.get_output_inventory()
-	for _, ing in ipairs(self.recipe.ingredients) do
+	for _, ing in ipairs(self.recipe.products) do
 		if not out_inv.can_insert({name = ing.name, count = ing.amount}) then
 			return true
 		end
@@ -665,7 +794,7 @@ function SmeltItem:empty_smelter()
 			out_inv.remove(stack)
 			player_inv_insert(stack)
 			if item == self.item then
-				self.cur_amount = self.cur_amount + stack.count
+				self.reservation:alloc_item(item, count)
 			end
 		else
 			player.print('cannot empty furnace')
@@ -675,7 +804,76 @@ function SmeltItem:empty_smelter()
 	return true
 end
 
+function SmeltItem:need_fuel()
+	local fuel_inv = self.smelter.get_fuel_inventory()
+	return fuel_inv.is_empty()
+end
+
+function SmeltItem:need_empty()
+	local out_inv = self.smelter.get_output_inventory()
+	local reserved = self.reservation:item_count(self.item)
+	local out = out_inv.get_item_count(self.item)
+	return self:is_smelter_full() or out + reserved >= self.amount
+end
+
+-- Return table of item to remaining count needed.
+function SmeltItem:feeding_amounts()
+	local out_inv = self.smelter.get_output_inventory()
+	local pending = out_inv.get_item_count(self.item)
+	local remaining = self.amount - self.reservation:item_count(self.item) - pending
+	local remaining_runs = math.ceil(remaining / self.recipe_amount)
+	if self.smelter.is_crafting() then
+		remaining_runs = remaining_runs - 1
+	end
+
+	local amounts = {}
+	local in_inv = self.smelter.get_inventory(defines.inventory.furnace_source)
+	for _, ing in ipairs(self.recipe.ingredients) do
+		local needed = remaining_runs * ing.amount
+		local tofeed = needed - in_inv.get_item_count(ing.name)
+		if tofeed > 0 then
+			amounts[ing.name] = tofeed
+		else
+			amounts[ing.name] = 0
+		end
+	end
+	return amounts
+end
+
+function SmeltItem:need_feed(amounts)
+	local in_inv = self.smelter.get_inventory(defines.inventory.furnace_source)
+	local any_empty = false
+	for _, ing in ipairs(self.recipe.ingredients) do
+		local have = in_inv.get_item_count(ing.name)
+		if amounts[ing.name] > 0 and have < ing.amount then
+			any_empty = true
+		end
+	end
+	return any_empty
+end
+
+function SmeltItem:check_status()
+	if self.reservation:item_count(self.item) >= self.amount then
+		return (Status.done())
+	end
+	if self.smelter == nil or not self.smelter.valid then
+		return (Status.busy())
+	end
+	if self:need_empty() then
+		return (Status.busy())
+	end
+	if self:need_fuel() then
+		return (Status.busy())
+	end
+	local feed_amounts = self:feeding_amounts()
+	if self:need_feed(feed_amounts) then
+		return (Status.busy())
+	end
+	return (Status.wait())
+end
+
 function SmeltItem:update()
+	self:take_deps(self.reservation)
 	self:clear_deps()
 	if not self:set_smelter() then
 		return (Status.busy())
@@ -683,8 +881,7 @@ function SmeltItem:update()
 
 	local near_smelter = entity_distance_to_player(self.smelter) < 3
 
-	local out_inv = self.smelter.get_output_inventory()
-	if self:is_smelter_full() or out_inv.get_item_count(self.item) + self.cur_amount >= self.amount then
+	if self:need_empty() then
 		if not near_smelter then
 			self:go_near_smelter()
 			return (Status.busy())
@@ -693,20 +890,20 @@ function SmeltItem:update()
 			return (Status.err())
 		end
 
-		if self.cur_amount >= self.amount then
+		if self.reservation:item_count(self.item) >= self.amount then
 			return (Status.done())
 		end
 	end
 
-	local fuel_inv = self.smelter.get_fuel_inventory()
-	if fuel_inv.is_empty() then
-		if not near_smelter then
-			self:go_near_smelter()
-			return (Status.busy())
-		end
-		local fuel_amount = player_inv_get_item_count('raw-wood')
+	if self:need_fuel() then
+		local fuel_inv = self.smelter.get_fuel_inventory()
+		local fuel_amount = self.reservation:alloc_item_to('raw-wood', 20)
 		if fuel_amount < 1 then
 			table.insert(self.deps, GetItem:new('raw-wood', 20))
+			return (Status.busy())
+		end
+		if not near_smelter then
+			self:go_near_smelter()
 			return (Status.busy())
 		end
 		if fuel_amount > 20 then
@@ -715,7 +912,7 @@ function SmeltItem:update()
 		local stack = {name='raw-wood', count=fuel_amount}
 		local insert_amount = fuel_inv.insert(stack)
 		if insert_amount > 0 then
-			player_inv_remove({name='raw-wood', count=insert_amount})
+			self.reservation:use_item('raw-wood', insert_amount)
 		else
 			player.print('could not fuel furnace')
 			return (Status.err())
@@ -723,47 +920,50 @@ function SmeltItem:update()
 	end
 
 	local pending_amount = self:pending_amount()
-	if self.cur_amount + pending_amount >= self.amount then
+	if self.reservation:item_count(self.item) + pending_amount >= self.amount then
 		return (Status.wait())
 	end
 
-	-- Feed inputs
-	local remaining = self.amount - self.cur_amount
-	local remaining_runs = math.ceil(remaining / self.recipe_amount)
-	if self.smelter.is_crafting() then
-		remaining_runs = remaining_runs - 1
+	local feed_amounts = self:feeding_amounts()
+	if not self:need_feed(feed_amounts) then
+		return (Status.wait())
 	end
+
+	local real_feed_amounts = {}
+
 	local in_inv = self.smelter.get_inventory(defines.inventory.furnace_source)
 	for _, ing in ipairs(self.recipe.ingredients) do
-		local have = in_inv.get_item_count(ing.name)
-		local needed = ing.amount * remaining_runs
-		if have < needed then
-			local want = needed - have
-			local player_have = player_inv_get_item_count(ing.name)
-			local insert = player_have
-			if insert > want then
-				insert = want
+		local inv_amount = in_inv.get_item_count(ing.name)
+		local stack_size = game.item_prototypes[ing.name].stack_size
+		local have = self.reservation:item_count(ing.name)
+		local tofeed = feed_amounts[ing.name]
+		if tofeed + inv_amount > stack_size then
+			tofeed = stack_size - inv_amount
+		end
+		if have < tofeed then
+			table.insert(self.deps, GetItem:new(ing.name, tofeed))
+			return (Status.busy())
+		end
+		real_feed_amounts[ing.name] = tofeed
+	end
+
+	if not near_smelter then
+		self:go_near_smelter()
+		return (Status.busy())
+	end
+	for _, ing in ipairs(self.recipe.ingredients) do
+		local amount = real_feed_amounts[ing.name]
+		if in_inv.can_insert({name=ing.name, count=amount}) then
+			amount = in_inv.insert({name=ing.name, count=amount})
+			if ing.name == nil then
+				ing.name.what.what = 1
 			end
-			if insert > 0 then
-				if in_inv.can_insert({name=ing.name, count=insert}) then
-					if not near_smelter then
-						self:go_near_smelter()
-						return (Status.busy())
-					end
-					insert = in_inv.insert({name=ing.name, count=insert})
-					player_inv_remove({name=ing.name, count=insert})
-				else
-					player.print('cannot insert into furnace')
-					return (Status.err())
-				end
-			end
-			if insert < want then
-				table.insert(self.deps, GetItem:new(ing.name, want - insert))
-				return (Status.busy())
-			end
+			self.reservation:use_item(ing.name, amount)
+		else
+			player.print('cannot insert into furnace')
+			return (Status.err())
 		end
 	end
-	-- We
 	return (Status.wait())
 end
 
@@ -799,7 +999,7 @@ function GetItem:new(item, amount)
 end
 
 function GetItem:get_inv_count()
-	return player_inv_get_item_count(self.item)
+	return self.reservation:item_count(self.item)
 end
 
 function GetItem:check_status()
@@ -811,6 +1011,7 @@ end
 
 function GetItem:craft_update()
 	local crafting_count = 0
+	-- TODO: reserve ingredients
 	if player.crafting_queue ~= nil then
 		for _, q in ipairs(player.crafting_queue) do
 			if q.recipe == self.recipe.name then
@@ -825,26 +1026,53 @@ function GetItem:craft_update()
 	-- We must craft now
 	local togo = self.amount - inv_count - crafting_count
 	local runs = math.ceil(togo / self.recipe_amount)
-	local tocraft = player.get_craftable_count(self.recipe.name)
-	if tocraft > runs then
-		tocraft = runs
+	local runs_now = runs
+	for _, ing in ipairs(self.recipe.ingredients) do
+		local needed = runs * ing.amount
+		local avail = self.reservation:alloc_item_to(ing.name, needed)
+		local can_run = math.floor(avail / ing.amount)
+		if can_run < runs_now then
+			runs_now = can_run
+		end
 	end
-	if tocraft > 0 then
-		tocraft = player.begin_crafting({count=tocraft, recipe=self.recipe})
+	if runs_now > 0 then
+		runs_now = player.begin_crafting({count=runs_now, recipe=self.recipe})
+		for _, ing in ipairs(self.recipe.ingredients) do
+			self.reservation:free_item(ing.name, ing.amount * runs_now)
+		end
 	end
-	runs = runs - tocraft
-	if runs == 0 then
+	local runs_to_get = runs - runs_now
+	if runs_to_get == 0 then
 		return (Status.wait())
 	end
 	-- We need more ingredients
 	for _, ing in ipairs(self.recipe.ingredients) do
-		table.insert(self.deps, GetItem:new(ing.name, ing.amount * runs))
+		local needed = runs_to_get * ing.amount
+		local avail = self.reservation:alloc_item_to(ing.name, needed)
+		if needed > avail then
+			table.insert(self.deps, GetItem:new(ing.name, needed - avail))
+		end
 	end
 	return (Status.busy())
 end
 
 function GetItem:update()
+	self:take_deps(self.reservation)
 	self:clear_deps()
+	if self.reservation:alloc_item_to(self.item, self.amount) > self.amount then
+		return (Status.done())
+	end
+	local prototype = game.item_prototypes[self.item]
+	if self.reservation:item_count(self.item) < self.amount then
+		if prototype.type == "mining-tool" then
+			local tool_inv = player.get_inventory(defines.inventory.player_tools)
+			local count = tool_inv.get_item_count(self.item)
+			if count > 1 then
+				count = self.reservation:create_item(self.item, count - 1)
+				tool_inv.remove({name = self.item, count = count})
+			end
+		end
+	end
 	local status = self:check_status()
 	if status == Status.done() then
 		return status
@@ -870,12 +1098,60 @@ function GetItem:update()
 	return (Status.busy())
 end
 
+local EquipItem = Plan:new_plan_type()
+
+function EquipItem:new(item, count)
+	local plan = self.raw_new()
+	plan.item = item
+	plan.count = count
+	local prototype = game.item_prototypes[item]
+	if prototype.type == "mining-tool" then
+		plan.inventory = defines.inventory.player_tools
+	else
+		plan.inventory = defines.inventory.player_guns
+	end
+	return plan
+end
+
+function EquipItem:check_status()
+	if self.reservation:total_items() > 0 then
+		return (Status.busy())
+	end
+	local inv = player.get_inventory(self.inventory)
+	if inv.get_item_count(self.item) >= self.count then
+		return (Status.done())
+	end
+	return (Status.busy())
+end
+
+function EquipItem:update()
+	self:clear_deps()
+	self.reservation:free()
+	-- We don't care if we had it reserved or not.
+	local inv = player.get_inventory(self.inventory)
+	local count = inv.get_item_count(self.item)
+	if count >= self.count then
+		return (Status.done())
+	end
+	local inv_count = self.reservation:alloc_item_to(self.item, self.count - count)
+	if inv_count > 0 then
+		inv_count = inv.insert({name=self.item, count=inv_count})
+		player_inv_remove({name=self.item, count=inv_count})
+	end
+	count = inv.get_item_count(self.item)
+	if count >= self.count then
+		return (Status.done())
+	end
+	table.insert(self.deps, GetItem:new(self.item, self.count - count))
+	return (Status.busy())
+end
+
 local MasterPlan = Plan:new_plan_type()
 
 function MasterPlan:new()
 	local plan = self.raw_new()
 	plan.deps = {
-		GetItem:new("iron-axe", 2),
+		EquipItem:new("iron-axe", 2),
 		GetItem:new("boiler", 14),
 		GetItem:new("steam-engine", 10),
 		GetItem:new("offshore-pump", 1),
@@ -887,6 +1163,7 @@ local action = nil
 local deptree_button = nil
 local pause_button = nil
 local ff_button = nil
+local one_x_button = nil
 
 script.on_event(defines.events.on_player_created, function(event)
 	if player ~= nil then
@@ -920,11 +1197,14 @@ script.on_event(defines.events.on_player_created, function(event)
 	deptree_button.caption = 'Show deptree'
 	pause_button = player.gui.top.add({type='button', name='pause'})
 	pause_button.caption = 'Pause'
+	one_x_button = player.gui.top.add({type='button', name='one_x'})
+	one_x_button.caption = '1x'
 	ff_button = player.gui.top.add({type='button', name='ff'})
 	ff_button.caption = 'ff'
 end)
 
 local paused = false
+local game_speed = 1.0
 
 script.on_event(defines.events.on_gui_click, function(event)
 	if event.element == deptree_button then
@@ -940,11 +1220,17 @@ script.on_event(defines.events.on_gui_click, function(event)
 			paused = true
 		end
 	elseif event.element == ff_button then
-		if game.speed > 1.0 then
-			game.speed = 1.0
+		if game_speed < 5.0 then
+			game_speed = 5.0
 		else
-			game.speed = 10.0
+			game_speed = game_speed + 5.0
 		end
+		player.print('Setting game.speed to '..tostring(game_speed))
+		game.speed = game_speed
+	elseif event.element == one_x_button then
+		game_speed = 1.0
+		game.speed = game_speed
+		player.print('Setting game.speed to 1.0')
 	end
 end)
 
